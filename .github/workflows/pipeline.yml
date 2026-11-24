@@ -1,0 +1,75 @@
+name: DevSecOps pipeline
+
+# Rol A: esqueleto base sobre OWASP NodeGoat. B añade las etapas de seguridad
+# (SAST/SCA/IaC/DAST) y gates; C añade la subida a DefectDojo
+# (secrets DEFECTDOJO_URL / DEFECTDOJO_API_KEY).
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: nodegoat:${{ github.sha }}
+  APP_URL: http://localhost:4000
+
+jobs:
+  build-test:
+    name: 1. Build & calidad de código
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      # NodeGoat arrastra dependencias antiguas a propósito
+      - run: npm ci || npm install
+      # mismo linter que el workflow original de NodeGoat
+      - run: npx --yes jshint@2.12.0 .
+
+  image:
+    name: 2. Imagen Docker
+    needs: build-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t "$IMAGE" .
+      - run: docker save "$IMAGE" -o image.tar
+      - uses: actions/upload-artifact@v4
+        with:
+          name: image
+          path: image.tar
+          retention-days: 1
+
+  deploy-for-dast:
+    name: 3. Despliegue de la app (base para DAST)
+    needs: image
+    runs-on: ubuntu-latest
+    services:
+      mongo:
+        image: mongo:4.4
+        ports:
+          - 27017:27017
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: image
+      - run: docker load -i image.tar
+      - name: Arrancar app en localhost:4000
+        run: |
+          docker run -d --name app --network host \
+            -e NODE_ENV=development \
+            -e MONGODB_URI=mongodb://localhost:27017/nodegoat \
+            "$IMAGE" sh -c "node artifacts/db-reset.js && npm start"
+      - name: Esperar a que responda
+        run: |
+          for i in $(seq 1 30); do
+            curl -fs "$APP_URL/login" >/dev/null && exit 0
+            sleep 2
+          done
+          docker logs app; exit 1
+      # TODO(B): aquí va la etapa DAST (ZAP) contra $APP_URL, en este mismo job
+      #          (la app solo vive mientras dura el job).
