@@ -1,8 +1,9 @@
 name: DevSecOps pipeline
 
-# Rol A: esqueleto base sobre OWASP NodeGoat. B añade las etapas de seguridad
-# (SAST/SCA/IaC/DAST) y gates; C añade la subida a DefectDojo
-# (secrets DEFECTDOJO_URL / DEFECTDOJO_API_KEY).
+# Rol A: esqueleto base sobre OWASP NodeGoat.
+# Rol B: etapas de seguridad (SAST Semgrep, SCA Trivy fs, IaC Trivy config, DAST OWASP ZAP)
+#        y quality gates (modo aviso en build/image; bloqueante en DAST).
+# Rol C: job de subida automática a DefectDojo (secrets DEFECTDOJO_URL / DEFECTDOJO_API_KEY).
 on:
   push:
   pull_request:
@@ -16,7 +17,7 @@ env:
 
 jobs:
   build-test:
-    name: 1. Build & calidad de código
+    name: 1. Build, calidad, SAST (Semgrep) & SCA (Trivy)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -29,12 +30,92 @@ jobs:
       # mismo linter que el workflow original de NodeGoat
       - run: npx --yes jshint@2.12.0 .
 
+      # --- SAST: Semgrep (modo aviso, umbral: severidad ERROR) ---
+      - name: SAST — Semgrep (modo aviso)
+        continue-on-error: true
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/src" semgrep/semgrep \
+            semgrep scan \
+            --config p/javascript \
+            --config p/nodejs \
+            --config p/owasp-top-ten \
+            --metrics=off \
+            --json --output /src/semgrep-report.json \
+            /src
+          TOTAL=$(jq '.results | length' semgrep-report.json)
+          ERRORS=$(jq '[.results[] | select(.extra.severity == "ERROR")] | length' semgrep-report.json)
+          echo "Semgrep SAST: ${TOTAL} hallazgos totales (${ERRORS} de severidad ERROR)."
+          if [ "$ERRORS" -gt 0 ]; then
+            echo "::warning::Quality Gate SAST (modo aviso): ${ERRORS} hallazgos ERROR superan el umbral (0)."
+            exit 1
+          fi
+
+      - name: Subir informe SAST (Semgrep)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: semgrep-report
+          path: semgrep-report.json
+          if-no-files-found: warn
+          retention-days: 7
+
+      # --- SCA: Trivy fs (modo aviso, umbral: HIGH/CRITICAL) ---
+      - name: SCA — Trivy fs (modo aviso)
+        continue-on-error: true
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/src" aquasec/trivy:latest \
+            fs --scanners vuln \
+            --format json --output /src/trivy-sca-report.json \
+            /src
+          TOTAL=$(jq '[.Results[]?.Vulnerabilities[]?] | length' trivy-sca-report.json)
+          HIGH_CRIT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "HIGH" or .Severity == "CRITICAL")] | length' trivy-sca-report.json)
+          echo "Trivy SCA: ${TOTAL} vulnerabilidades totales (${HIGH_CRIT} HIGH/CRITICAL)."
+          if [ "$HIGH_CRIT" -gt 0 ]; then
+            echo "::warning::Quality Gate SCA (modo aviso): ${HIGH_CRIT} vulnerabilidades HIGH/CRITICAL superan el umbral (0)."
+            exit 1
+          fi
+
+      - name: Subir informe SCA (Trivy)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-sca-report
+          path: trivy-sca-report.json
+          if-no-files-found: warn
+          retention-days: 7
+
   image:
-    name: 2. Imagen Docker
+    name: 2. Imagen Docker & IaC (Trivy config)
     needs: build-test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      # --- IaC: Trivy config sobre Dockerfile y docker-compose (modo aviso, umbral: HIGH/CRITICAL) ---
+      - name: IaC — Trivy config (modo aviso)
+        continue-on-error: true
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/src" aquasec/trivy:latest \
+            config \
+            --format json --output /src/trivy-iac-report.json \
+            /src
+          TOTAL=$(jq '[.Results[]?.Misconfigurations[]?] | length' trivy-iac-report.json)
+          HIGH_CRIT=$(jq '[.Results[]?.Misconfigurations[]? | select(.Severity == "HIGH" or .Severity == "CRITICAL")] | length' trivy-iac-report.json)
+          echo "Trivy IaC: ${TOTAL} misconfigurations totales (${HIGH_CRIT} HIGH/CRITICAL)."
+          if [ "$HIGH_CRIT" -gt 0 ]; then
+            echo "::warning::Quality Gate IaC (modo aviso): ${HIGH_CRIT} misconfigurations HIGH/CRITICAL superan el umbral (0)."
+            exit 1
+          fi
+
+      - name: Subir informe IaC (Trivy)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-iac-report
+          path: trivy-iac-report.json
+          if-no-files-found: warn
+          retention-days: 7
+
       - run: docker build -t "$IMAGE" .
       - run: docker save "$IMAGE" -o image.tar
       - uses: actions/upload-artifact@v4
@@ -44,7 +125,7 @@ jobs:
           retention-days: 1
 
   deploy-for-dast:
-    name: 3. Despliegue de la app (base para DAST)
+    name: 3. Despliegue & DAST (OWASP ZAP · Gate bloqueante)
     needs: image
     runs-on: ubuntu-latest
     services:
@@ -71,5 +152,55 @@ jobs:
             sleep 2
           done
           docker logs app; exit 1
-      # TODO(B): aquí va la etapa DAST (ZAP) contra $APP_URL, en este mismo job
-      #          (la app solo vive mientras dura el job).
+
+      # --- DAST: OWASP ZAP Baseline (QUALITY GATE BLOQUEANTE) ---
+      - name: DAST — OWASP ZAP Baseline (Quality Gate bloqueante)
+        run: |
+          mkdir -p zap-reports
+          cp security-config/zap-rules.tsv zap-reports/zap-rules.tsv
+          chmod -R 777 zap-reports
+          set +e
+          docker run --rm --network host \
+            -v "${{ github.workspace }}/zap-reports:/zap/wrk:rw" \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap-baseline.py \
+            -t "$APP_URL" \
+            -c zap-rules.tsv \
+            -x zap-report.xml \
+            -J zap-report.json \
+            -r zap-report.html
+          ZAP_RC=$?
+          set -e
+          echo "OWASP ZAP finalizado con código de salida: ${ZAP_RC}"
+          if [ "$ZAP_RC" -eq 1 ]; then
+            echo "::error::Quality Gate DAST (BLOQUEANTE): OWASP ZAP detectó vulnerabilidades marcadas como FAIL en security-config/zap-rules.tsv."
+            exit 1
+          elif [ "$ZAP_RC" -eq 3 ]; then
+            echo "::error::Error interno ejecutando OWASP ZAP (código 3)."
+            exit 3
+          elif [ "$ZAP_RC" -eq 2 ]; then
+            echo "::warning::OWASP ZAP detectó avisos (WARN) por debajo del umbral de bloqueo."
+          fi
+
+      - name: Subir informes DAST (OWASP ZAP)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-report
+          path: |
+            zap-reports/zap-report.xml
+            zap-reports/zap-report.json
+            zap-reports/zap-report.html
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Detener contenedor de la app
+        if: always()
+        run: docker rm -f app || true
+
+  # TODO(C): añadir aquí el job `defectdojo` con:
+  #   needs: [build-test, image, deploy-for-dast]
+  #   if: always()
+  # Descargar los 4 artifacts (`semgrep-report`, `trivy-sca-report`,
+  # `trivy-iac-report`, `zap-report`) y subirlos a DefectDojo vía API
+  # (`reimport-scan`) usando secrets.DEFECTDOJO_URL y secrets.DEFECTDOJO_API_KEY.

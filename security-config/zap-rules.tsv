@@ -1,0 +1,22 @@
+# Reglas de OWASP ZAP Baseline para OWASP NodeGoat (Equipo ST22)
+# Formato: <ID_regla><TAB><ACCIÓN (IGNORE|WARN|FAIL)><TAB><Descripción>
+# Las reglas marcadas como FAIL disparan el Quality Gate bloqueante del job deploy-for-dast.
+
+# --- Reglas BLOQUEANTES (FAIL) — vulnerabilidades críticas/altas o medias de alto impacto ---
+10020	FAIL	(Missing Anti-clickjacking Header / X-Frame-Options)
+10038	FAIL	(Content Security Policy (CSP) Header Not Set)
+10202	FAIL	(Absence of Anti-CSRF Tokens)
+40012	FAIL	(Cross Site Scripting (Reflected))
+40014	FAIL	(Cross Site Scripting (Persistent))
+40018	FAIL	(SQL Injection)
+90019	FAIL	(Server Side Code Injection)
+
+# --- Reglas en MODO AVISO (WARN) — severidad baja/informativa ---
+10010	WARN	(Cookie No HttpOnly Flag)
+10011	WARN	(Cookie Without Secure Flag)
+10015	WARN	(Re-examine Cache-control Directives)
+10021	WARN	(X-Content-Type-Options Header Missing)
+10035	WARN	(Strict-Transport-Security Header Not Set)
+10036	WARN	(Server Leaks Version Information via Server Header)
+10037	WARN	(Server Leaks Information via X-Powered-By Header)
+10096	WARN	(Timestamp Disclosure)
